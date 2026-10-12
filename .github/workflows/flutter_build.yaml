@@ -1,0 +1,90 @@
+name: Flutter Build
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP source (dari GitHub Release)"
+        required: true
+        type: string
+      tag:
+        description: "Tag release"
+        required: true
+        type: string
+      build_type:
+        description: "debug atau release"
+        required: true
+        default: "release"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download source ZIP
+        env:
+          ZIP_URL: ${{ github.event.inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          echo "Downloading source..."
+          curl -fsSL -o source.zip "$ZIP_URL"
+          mkdir -p project
+          unzip -q source.zip -d project
+          # Cari pubspec.yaml (root atau subfolder)
+          PUBSPEC=$(find project -name pubspec.yaml -type f | head -n 1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di ZIP"
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project root: $PROJECT_DIR"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          BT="${{ github.event.inputs.build_type }}"
+          if [ "$BT" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find "${{ env.PROJECT_DIR }}/build" -type f \( -name "*.apk" -o -name "*.aab" \) -exec cp -v {} out/ \; || true
+          ls -la out/ || true
+          if [ -z "$(ls -A out 2>/dev/null)" ]; then
+            echo "::error::Tidak ada APK/AAB hasil build"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.event.inputs.tag }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 5
