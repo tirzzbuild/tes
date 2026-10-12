@@ -1,0 +1,120 @@
+name: Genetik Universal ZIP Build
+
+# Ditrigger oleh bot Telegram (profil genetik) lewat workflow_dispatch.
+# Input: release_tag, asset_name, build_type
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag release yang berisi source.zip"
+        required: true
+        type: string
+      asset_name:
+        description: "Nama asset di release"
+        required: true
+        default: "source.zip"
+        type: string
+      build_type:
+        description: "auto / debug / release"
+        required: false
+        default: "auto"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      # Flutter 3.41.9 — sebelum IconData final (kompatibel font_awesome_flutter lama)
+      - name: Setup Flutter SDK (pinned 3.41.9)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
+
+      - name: Download ZIP dari Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          ASSET: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+          if gh release download "$TAG" -p "$ASSET" -O project.zip 2>/tmp/e.txt; then
+            echo "OK gh release download"
+          else
+            cat /tmp/e.txt || true
+            API="https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG"
+            ASSET_URL=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" \
+              | python3 -c "import sys,json,os; a=json.load(sys.stdin).get('assets') or []; n=os.environ.get('ASSET',''); print(next((x['url'] for x in a if x.get('name')==n), a[0]['url'] if a else ''))")
+            curl -fsSL -L -o project.zip -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "$ASSET_URL"
+          fi
+          if [ ! -s project.zip ]; then
+            echo "::error::Gagal unduh asset $ASSET dari tag $TAG"
+            exit 1
+          fi
+
+      - name: Extract ZIP
+        run: |
+          rm -rf project
+          mkdir -p project
+          unzip -q project.zip -d project
+          shopt -s nullglob dotglob
+          entries=(project/*/)
+          if [ "${#entries[@]}" -eq 1 ] && [ -f "${entries[0]}pubspec.yaml" ]; then
+            tmp=$(mktemp -d)
+            mv "${entries[0]}"* "$tmp"/
+            rm -rf project
+            mv "$tmp" project
+          fi
+          # Cari pubspec di subfolder jika perlu
+          if [ ! -f project/pubspec.yaml ]; then
+            PUB=$(find project -name pubspec.yaml -type f | head -n 1)
+            if [ -n "$PUB" ]; then
+              ROOT=$(dirname "$PUB")
+              tmp=$(mktemp -d)
+              cp -a "$ROOT"/. "$tmp"/
+              rm -rf project
+              mv "$tmp" project
+            fi
+          fi
+          if [ ! -f project/pubspec.yaml ]; then
+            echo "::error::pubspec.yaml tidak ditemukan"
+            find project -maxdepth 4 -type f | head -40 || true
+            exit 1
+          fi
+
+      - name: Flutter pub get
+        working-directory: project
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: project
+        run: |
+          BT="${{ inputs.build_type }}"
+          if [ "$BT" = "debug" ]; then
+            flutter build apk --debug
+          else
+            flutter build apk --release
+          fi
+
+      - name: Upload APK sebagai artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genetik-apk-${{ inputs.release_tag }}
+          path: project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: warn
+          retention-days: 1
