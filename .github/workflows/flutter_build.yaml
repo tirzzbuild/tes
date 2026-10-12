@@ -1,235 +1,141 @@
-name: Flutter Build
+name: Flutter Build APK
+
+# Ditrigger oleh bot Telegram (Tirzz Build Bot) lewat workflow_dispatch.
+# Input dikirim oleh server.js -> triggerWorkflow(). Simpan file ini di repo target
+# (GITHUB_OWNER/GITHUB_REPO di .env bot) pada path: .github/workflows/flutter_build.yml
 on:
   workflow_dispatch:
     inputs:
       zip_url:
-        description: "URL download ZIP source (dari GitHub Release)"
+        description: "URL ZIP project Flutter (GitHub Release asset)"
         required: true
         type: string
       tag:
-        description: "Tag release"
+        description: "Tag unik build (dipakai untuk nama artifact & release cleanup)"
         required: true
         type: string
       build_type:
-        description: "debug atau release"
-        required: true
+        description: "Mode build: debug atau release"
+        required: false
         default: "release"
         type: string
-
-permissions:
-  contents: read
-  actions: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Download source ZIP
+      - name: Validasi input wajib
+        run: |
+          if [ -z "${{ inputs.zip_url }}" ]; then
+            echo "::error::Input zip_url kosong."
+            exit 1
+          fi
+          if [ -z "${{ inputs.tag }}" ]; then
+            echo "::error::Input tag kosong."
+            exit 1
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      # PENTING — JANGAN naikkan versi ini ke >= 3.44 kecuali font_awesome_flutter
+      # di project kamu sudah di-upgrade ke v11+. Flutter 3.44 menjadikan class
+      # IconData "final" (tidak bisa di-extend), yang membuat font_awesome_flutter
+      # versi lama (mis. 10.12.0) gagal compile dengan error:
+      #   "The class 'IconData' can't be extended outside of its library
+      #    because it's a final class."
+      # 3.41.x adalah rilis stabil terakhir SEBELUM breaking change tersebut.
+      - name: Setup Flutter SDK (pinned 3.41.x, sebelum breaking change IconData final)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
+
+      - name: Download ZIP project
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ZIP_URL: ${{ github.event.inputs.zip_url }}
-          TAG: ${{ github.event.inputs.tag }}
+          ZIP_URL: ${{ inputs.zip_url }}
+          TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          echo "Tag: $TAG"
-          if command -v gh >/dev/null 2>&1 && [ -n "$TAG" ]; then
-            if gh release download "$TAG" --pattern "*.zip" --output source.zip 2>/tmp/gh_dl_err.txt; then
-              echo "OK via gh release download"
-            else
-              cat /tmp/gh_dl_err.txt || true
-              gh release download "$TAG" --pattern "source.zip" --output source.zip 2>/dev/null || true
-            fi
+          # 1) gh release download (private + published)
+          if command -v gh >/dev/null 2>&1 && [ -n "${TAG:-}" ]; then
+            gh release download "$TAG" --pattern "*.zip" --output project.zip 2>/tmp/gh_err.txt \
+              || gh release download "$TAG" --pattern "source.zip" --output project.zip 2>/dev/null \
+              || true
           fi
-          if [ ! -f source.zip ] || [ ! -s source.zip ]; then
-            HTTP_CODE=$(curl -sS -L -o source.zip -w "%{http_code}" \
+          # 2) curl + token
+          if [ ! -f project.zip ] || [ ! -s project.zip ]; then
+            code=$(curl -sS -L -o project.zip -w "%{http_code}" \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/octet-stream" \
               "$ZIP_URL" || true)
-            if [ "$HTTP_CODE" != "200" ] || [ ! -s source.zip ]; then
-              OWNER_REPO="${{ github.repository }}"
-              API="https://api.github.com/repos/$OWNER_REPO/releases/tags/$TAG"
-              ASSET_API=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" \
-                | python3 -c "import sys,json; d=json.load(sys.stdin); a=d.get('assets') or []; print(a[0]['url'] if a else '')" 2>/dev/null || true)
-              if [ -n "${ASSET_API:-}" ]; then
-                curl -fsSL -L -o source.zip -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "$ASSET_API"
-              fi
+            echo "curl HTTP $code"
+          fi
+          # 3) API by tag
+          if [ ! -f project.zip ] || [ ! -s project.zip ]; then
+            API="https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG"
+            ASSET=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" \
+              | python3 -c "import sys,json;a=json.load(sys.stdin).get('assets') or [];print(a[0]['url'] if a else '')" || true)
+            if [ -n "${ASSET:-}" ]; then
+              curl -fsSL -L -o project.zip -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "$ASSET"
             fi
           fi
-          if [ ! -f source.zip ] || [ ! -s source.zip ]; then
-            echo "::error::Gagal mengunduh source ZIP. Tag=$TAG"
+          if [ ! -f project.zip ] || [ ! -s project.zip ]; then
+            echo "::error::Gagal unduh ZIP (404/auth). Pastikan release published. tag=$TAG"
             exit 1
           fi
+          echo "ZIP size=$(wc -c < project.zip)"
+
+      - name: Extract ZIP
+        run: |
+          rm -rf project
           mkdir -p project
-          unzip -q source.zip -d project
-          PUBSPEC=$(find project -name pubspec.yaml -type f | head -n 1)
-          if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan di ZIP"
-            find project -maxdepth 4 -type f | head -50 || true
+          unzip -q project.zip -d project
+
+          # Kalau isi ZIP cuma 1 folder pembungkus di root, naikkan isinya
+          shopt -s nullglob dotglob
+          entries=(project/*/)
+          if [ "${#entries[@]}" -eq 1 ] && [ -f "${entries[0]}pubspec.yaml" ]; then
+            tmp=$(mktemp -d)
+            mv "${entries[0]}"* "$tmp"/
+            rm -rf project
+            mv "$tmp" project
+          fi
+
+      - name: Validasi pubspec.yaml
+        run: |
+          if [ ! -f project/pubspec.yaml ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ZIP berisi project Flutter yang valid (pubspec.yaml di root project)."
             exit 1
           fi
-          PROJECT_DIR=$(dirname "$PUBSPEC")
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "PUBSPEC=$PUBSPEC" >> "$GITHUB_ENV"
-          echo "Project root: $PROJECT_DIR"
-
-      - name: Detect Flutter version from pubspec
-        id: flutter_ver
-        run: |
-          set -euo pipefail
-          PUBSPEC="${{ env.PUBSPEC }}"
-          # Baca constraint Dart/Flutter dari pubspec
-          SDK_LINE=$(grep -E '^[[:space:]]*sdk:' "$PUBSPEC" | head -1 || true)
-          FLUTTER_LINE=$(grep -E '^[[:space:]]*flutter:' "$PUBSPEC" | head -1 || true)
-          echo "sdk line: $SDK_LINE"
-          echo "flutter line: $FLUTTER_LINE"
-
-          # Default aman untuk kebanyakan base lama–menengah (hindari Flutter terbaru yang mem-final IconData)
-          # Flutter 3.24.x ≈ Dart 3.5; 3.27.x ≈ Dart 3.6; 3.29 ≈ Dart 3.7
-          CHOSEN="3.24.5"
-
-          # Jika constraint eksplisit >=3.7 / >=3.8 → butuh Flutter lebih baru
-          if echo "$SDK_LINE" | grep -qE '3\.(7|8|9)|4\.'; then
-            CHOSEN="3.29.3"
-          elif echo "$SDK_LINE" | grep -qE '3\.6'; then
-            CHOSEN="3.27.4"
-          elif echo "$SDK_LINE" | grep -qE '3\.5'; then
-            CHOSEN="3.24.5"
-          elif echo "$SDK_LINE" | grep -qE '3\.(3|4)'; then
-            CHOSEN="3.22.3"
-          elif echo "$SDK_LINE" | grep -qE '3\.(0|1|2)|2\.'; then
-            CHOSEN="3.16.9"
-          fi
-
-          # Override jika pubspec sebut flutter: ">=3.xx"
-          if echo "$FLUTTER_LINE" | grep -qE '3\.2[89]|3\.3'; then
-            CHOSEN="3.29.3"
-          elif echo "$FLUTTER_LINE" | grep -qE '3\.27'; then
-            CHOSEN="3.27.4"
-          fi
-
-          echo "flutter_version=$CHOSEN" >> "$GITHUB_OUTPUT"
-          echo "Selected Flutter: $CHOSEN"
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: ${{ steps.flutter_ver.outputs.flutter_version }}
-          channel: stable
-          cache: true
-
-      - name: Universal dependency autofix
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          set -euo pipefail
-          PUBSPEC="pubspec.yaml"
-          echo "=== Universal autofix (aman, non-destruktif) ==="
-
-          # Backup
-          cp -a pubspec.yaml pubspec.yaml.bak || true
-
-          # 1) font_awesome_flutter: v10.8+ bentrok IconData final di Flutter baru
-          #    Pin ke 10.7.0 yang masih kompatibel luas
-          if grep -qE 'font_awesome_flutter[[:space:]]*:' pubspec.yaml; then
-            echo "Fix: pin font_awesome_flutter ke 10.7.0 (hindari IconData final)"
-            python3 - <<'PY'
-          import re, pathlib
-          p = pathlib.Path("pubspec.yaml")
-          t = p.read_text(encoding="utf-8")
-          t2 = re.sub(
-              r'(font_awesome_flutter\s*:\s*)[^\n#]+',
-              r'\g<1>10.7.0',
-              t,
-              count=1,
-          )
-          if t2 != t:
-              p.write_text(t2, encoding="utf-8")
-              print("font_awesome_flutter pinned to 10.7.0")
-          else:
-              print("font_awesome_flutter line not changed (pattern miss)")
-          PY
-          fi
-
-          # 2) Pastikan publish_to / environment ada minimal
-          if ! grep -qE '^environment:' pubspec.yaml; then
-            echo "Warning: tidak ada environment: di pubspec"
-          fi
-
-          # 3) Android: naikkan minSdk jika terlalu rendah (opsional, hanya jika file ada)
-          APP_GRADLE=""
-          if [ -f android/app/build.gradle ]; then APP_GRADLE=android/app/build.gradle; fi
-          if [ -f android/app/build.gradle.kts ]; then APP_GRADLE=android/app/build.gradle.kts; fi
-          if [ -n "$APP_GRADLE" ]; then
-            if grep -qE 'minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[1-9][0-9]?[[:space:]]*$' "$APP_GRADLE"; then
-              echo "Cek minSdk di $APP_GRADLE (tidak dipaksa ubah kecuali <21)"
-              # Naikkan minSdk < 21 → 21 (plugin modern butuh)
-              sed -i -E 's/(minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*)([0-9]+)/\1\3/' "$APP_GRADLE" || true
-              python3 - <<PY
-          import re, pathlib
-          p = pathlib.Path("$APP_GRADLE")
-          t = p.read_text(encoding="utf-8")
-          def bump(m):
-              key, ver = m.group(1), int(m.group(2))
-              if ver < 21:
-                  print(f"minSdk {ver} -> 21")
-                  return f"{key}21"
-              return m.group(0)
-          t2 = re.sub(r'(minSdk(?:Version)?\s*[:=]?\s*)(\d+)', bump, t)
-          if t2 != t:
-              p.write_text(t2, encoding="utf-8")
-          PY
-            fi
-          fi
-
-          echo "=== Autofix selesai ==="
-          head -80 pubspec.yaml || true
 
       - name: Flutter pub get
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          set -euo pipefail
-          flutter --version
-          flutter pub get || {
-            echo "pub get gagal — coba pub upgrade terbatas"
-            flutter pub upgrade --major-versions || true
-            flutter pub get
-          }
+        working-directory: project
+        run: flutter pub get
 
       - name: Build APK
-        working-directory: ${{ env.PROJECT_DIR }}
+        working-directory: project
         run: |
-          set -euo pipefail
-          BT="${{ github.event.inputs.build_type }}"
-          if [ "$BT" = "debug" ]; then
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
             flutter build apk --debug
           else
             flutter build apk --release
           fi
 
-      - name: Collect APK
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          find "${{ env.PROJECT_DIR }}/build" -type f \( -name "*.apk" -o -name "*.aab" \) -exec cp -v {} out/ \; || true
-          ls -la out/ || true
-          if [ -z "$(ls -A out 2>/dev/null)" ]; then
-            echo "::error::Tidak ada APK/AAB hasil build"
-            exit 1
-          fi
-
-      - name: Upload artifact
+      - name: Upload APK sebagai artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-${{ github.event.inputs.tag }}
-          path: out/
-          if-no-files-found: error
-          retention-days: 5
+          name: apk-${{ inputs.tag }}
+          path: project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: warn
+          retention-days: 1
