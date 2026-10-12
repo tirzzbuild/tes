@@ -23,7 +23,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,61 +36,83 @@ jobs:
         run: |
           set -euo pipefail
           echo "Tag: $TAG"
-          echo "ZIP_URL (masked): $(echo "$ZIP_URL" | sed 's/[a-zA-Z0-9_-]\{12,\}/***MASK***/g')"
-
-          # 1) Prefer gh release download (works for private + published releases)
           if command -v gh >/dev/null 2>&1 && [ -n "$TAG" ]; then
-            echo "Mencoba: gh release download $TAG"
             if gh release download "$TAG" --pattern "*.zip" --output source.zip 2>/tmp/gh_dl_err.txt; then
               echo "OK via gh release download"
             else
-              echo "gh release download gagal:"
               cat /tmp/gh_dl_err.txt || true
-              # Coba nama asset umum
               gh release download "$TAG" --pattern "source.zip" --output source.zip 2>/dev/null || true
             fi
           fi
-
-          # 2) Fallback: curl dengan Authorization (API asset / browser URL)
           if [ ! -f source.zip ] || [ ! -s source.zip ]; then
-            echo "Fallback: curl authenticated..."
-            HTTP_CODE=$(curl -sS -L -o source.zip -w "%{http_code}"               -H "Authorization: Bearer $GH_TOKEN"               -H "Accept: application/octet-stream"               "$ZIP_URL" || true)
-            echo "HTTP code: $HTTP_CODE"
+            HTTP_CODE=$(curl -sS -L -o source.zip -w "%{http_code}" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/octet-stream" \
+              "$ZIP_URL" || true)
             if [ "$HTTP_CODE" != "200" ] || [ ! -s source.zip ]; then
-              # 3) Fallback terakhir: API list assets by tag
-              echo "Fallback: API assets by tag..."
               OWNER_REPO="${{ github.repository }}"
               API="https://api.github.com/repos/$OWNER_REPO/releases/tags/$TAG"
-              ASSET_API=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API"                 | python3 -c "import sys,json; d=json.load(sys.stdin); a=d.get('assets') or []; print(a[0]['url'] if a else '')" 2>/dev/null || true)
-              if [ -n "$ASSET_API" ]; then
-                curl -fsSL -L -o source.zip                   -H "Authorization: Bearer $GH_TOKEN"                   -H "Accept: application/octet-stream"                   "$ASSET_API"
+              ASSET_API=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API" \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); a=d.get('assets') or []; print(a[0]['url'] if a else '')" 2>/dev/null || true)
+              if [ -n "${ASSET_API:-}" ]; then
+                curl -fsSL -L -o source.zip -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "$ASSET_API"
               fi
             fi
           fi
-
           if [ ! -f source.zip ] || [ ! -s source.zip ]; then
-            echo "::error::Gagal mengunduh source ZIP (404/auth). Pastikan release PUBLISHED (bukan draft) dan tag benar: $TAG"
-            ls -la || true
+            echo "::error::Gagal mengunduh source ZIP. Tag=$TAG"
             exit 1
           fi
-
-          echo "ZIP size: $(wc -c < source.zip) bytes"
           mkdir -p project
-          unzip -q source.zip -d project || {
-            echo "::error::ZIP rusak / bukan format zip"
-            file source.zip || true
-            exit 1
-          }
-
+          unzip -q source.zip -d project
           PUBSPEC=$(find project -name pubspec.yaml -type f | head -n 1)
           if [ -z "$PUBSPEC" ]; then
             echo "::error::pubspec.yaml tidak ditemukan di ZIP"
-            find project -maxdepth 3 -type f | head -50 || true
+            find project -maxdepth 4 -type f | head -50 || true
             exit 1
           fi
           PROJECT_DIR=$(dirname "$PUBSPEC")
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "PUBSPEC=$PUBSPEC" >> "$GITHUB_ENV"
           echo "Project root: $PROJECT_DIR"
+
+      - name: Detect Flutter version from pubspec
+        id: flutter_ver
+        run: |
+          set -euo pipefail
+          PUBSPEC="${{ env.PUBSPEC }}"
+          # Baca constraint Dart/Flutter dari pubspec
+          SDK_LINE=$(grep -E '^[[:space:]]*sdk:' "$PUBSPEC" | head -1 || true)
+          FLUTTER_LINE=$(grep -E '^[[:space:]]*flutter:' "$PUBSPEC" | head -1 || true)
+          echo "sdk line: $SDK_LINE"
+          echo "flutter line: $FLUTTER_LINE"
+
+          # Default aman untuk kebanyakan base lama–menengah (hindari Flutter terbaru yang mem-final IconData)
+          # Flutter 3.24.x ≈ Dart 3.5; 3.27.x ≈ Dart 3.6; 3.29 ≈ Dart 3.7
+          CHOSEN="3.24.5"
+
+          # Jika constraint eksplisit >=3.7 / >=3.8 → butuh Flutter lebih baru
+          if echo "$SDK_LINE" | grep -qE '3\.(7|8|9)|4\.'; then
+            CHOSEN="3.29.3"
+          elif echo "$SDK_LINE" | grep -qE '3\.6'; then
+            CHOSEN="3.27.4"
+          elif echo "$SDK_LINE" | grep -qE '3\.5'; then
+            CHOSEN="3.24.5"
+          elif echo "$SDK_LINE" | grep -qE '3\.(3|4)'; then
+            CHOSEN="3.22.3"
+          elif echo "$SDK_LINE" | grep -qE '3\.(0|1|2)|2\.'; then
+            CHOSEN="3.16.9"
+          fi
+
+          # Override jika pubspec sebut flutter: ">=3.xx"
+          if echo "$FLUTTER_LINE" | grep -qE '3\.2[89]|3\.3'; then
+            CHOSEN="3.29.3"
+          elif echo "$FLUTTER_LINE" | grep -qE '3\.27'; then
+            CHOSEN="3.27.4"
+          fi
+
+          echo "flutter_version=$CHOSEN" >> "$GITHUB_OUTPUT"
+          echo "Selected Flutter: $CHOSEN"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -101,12 +123,86 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: ${{ steps.flutter_ver.outputs.flutter_version }}
           channel: stable
           cache: true
 
+      - name: Universal dependency autofix
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          PUBSPEC="pubspec.yaml"
+          echo "=== Universal autofix (aman, non-destruktif) ==="
+
+          # Backup
+          cp -a pubspec.yaml pubspec.yaml.bak || true
+
+          # 1) font_awesome_flutter: v10.8+ bentrok IconData final di Flutter baru
+          #    Pin ke 10.7.0 yang masih kompatibel luas
+          if grep -qE 'font_awesome_flutter[[:space:]]*:' pubspec.yaml; then
+            echo "Fix: pin font_awesome_flutter ke 10.7.0 (hindari IconData final)"
+            python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path("pubspec.yaml")
+          t = p.read_text(encoding="utf-8")
+          t2 = re.sub(
+              r'(font_awesome_flutter\s*:\s*)[^\n#]+',
+              r'\g<1>10.7.0',
+              t,
+              count=1,
+          )
+          if t2 != t:
+              p.write_text(t2, encoding="utf-8")
+              print("font_awesome_flutter pinned to 10.7.0")
+          else:
+              print("font_awesome_flutter line not changed (pattern miss)")
+          PY
+          fi
+
+          # 2) Pastikan publish_to / environment ada minimal
+          if ! grep -qE '^environment:' pubspec.yaml; then
+            echo "Warning: tidak ada environment: di pubspec"
+          fi
+
+          # 3) Android: naikkan minSdk jika terlalu rendah (opsional, hanya jika file ada)
+          APP_GRADLE=""
+          if [ -f android/app/build.gradle ]; then APP_GRADLE=android/app/build.gradle; fi
+          if [ -f android/app/build.gradle.kts ]; then APP_GRADLE=android/app/build.gradle.kts; fi
+          if [ -n "$APP_GRADLE" ]; then
+            if grep -qE 'minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[1-9][0-9]?[[:space:]]*$' "$APP_GRADLE"; then
+              echo "Cek minSdk di $APP_GRADLE (tidak dipaksa ubah kecuali <21)"
+              # Naikkan minSdk < 21 → 21 (plugin modern butuh)
+              sed -i -E 's/(minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*)([0-9]+)/\1\3/' "$APP_GRADLE" || true
+              python3 - <<PY
+          import re, pathlib
+          p = pathlib.Path("$APP_GRADLE")
+          t = p.read_text(encoding="utf-8")
+          def bump(m):
+              key, ver = m.group(1), int(m.group(2))
+              if ver < 21:
+                  print(f"minSdk {ver} -> 21")
+                  return f"{key}21"
+              return m.group(0)
+          t2 = re.sub(r'(minSdk(?:Version)?\s*[:=]?\s*)(\d+)', bump, t)
+          if t2 != t:
+              p.write_text(t2, encoding="utf-8")
+          PY
+            fi
+          fi
+
+          echo "=== Autofix selesai ==="
+          head -80 pubspec.yaml || true
+
       - name: Flutter pub get
         working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
+        run: |
+          set -euo pipefail
+          flutter --version
+          flutter pub get || {
+            echo "pub get gagal — coba pub upgrade terbatas"
+            flutter pub upgrade --major-versions || true
+            flutter pub get
+          }
 
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
