@@ -16,6 +16,10 @@ on:
         default: "release"
         type: string
 
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,17 +30,62 @@ jobs:
 
       - name: Download source ZIP
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ZIP_URL: ${{ github.event.inputs.zip_url }}
+          TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          echo "Downloading source..."
-          curl -fsSL -o source.zip "$ZIP_URL"
+          echo "Tag: $TAG"
+          echo "ZIP_URL (masked): $(echo "$ZIP_URL" | sed 's/[a-zA-Z0-9_-]\{12,\}/***MASK***/g')"
+
+          # 1) Prefer gh release download (works for private + published releases)
+          if command -v gh >/dev/null 2>&1 && [ -n "$TAG" ]; then
+            echo "Mencoba: gh release download $TAG"
+            if gh release download "$TAG" --pattern "*.zip" --output source.zip 2>/tmp/gh_dl_err.txt; then
+              echo "OK via gh release download"
+            else
+              echo "gh release download gagal:"
+              cat /tmp/gh_dl_err.txt || true
+              # Coba nama asset umum
+              gh release download "$TAG" --pattern "source.zip" --output source.zip 2>/dev/null || true
+            fi
+          fi
+
+          # 2) Fallback: curl dengan Authorization (API asset / browser URL)
+          if [ ! -f source.zip ] || [ ! -s source.zip ]; then
+            echo "Fallback: curl authenticated..."
+            HTTP_CODE=$(curl -sS -L -o source.zip -w "%{http_code}"               -H "Authorization: Bearer $GH_TOKEN"               -H "Accept: application/octet-stream"               "$ZIP_URL" || true)
+            echo "HTTP code: $HTTP_CODE"
+            if [ "$HTTP_CODE" != "200" ] || [ ! -s source.zip ]; then
+              # 3) Fallback terakhir: API list assets by tag
+              echo "Fallback: API assets by tag..."
+              OWNER_REPO="${{ github.repository }}"
+              API="https://api.github.com/repos/$OWNER_REPO/releases/tags/$TAG"
+              ASSET_API=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$API"                 | python3 -c "import sys,json; d=json.load(sys.stdin); a=d.get('assets') or []; print(a[0]['url'] if a else '')" 2>/dev/null || true)
+              if [ -n "$ASSET_API" ]; then
+                curl -fsSL -L -o source.zip                   -H "Authorization: Bearer $GH_TOKEN"                   -H "Accept: application/octet-stream"                   "$ASSET_API"
+              fi
+            fi
+          fi
+
+          if [ ! -f source.zip ] || [ ! -s source.zip ]; then
+            echo "::error::Gagal mengunduh source ZIP (404/auth). Pastikan release PUBLISHED (bukan draft) dan tag benar: $TAG"
+            ls -la || true
+            exit 1
+          fi
+
+          echo "ZIP size: $(wc -c < source.zip) bytes"
           mkdir -p project
-          unzip -q source.zip -d project
-          # Cari pubspec.yaml (root atau subfolder)
+          unzip -q source.zip -d project || {
+            echo "::error::ZIP rusak / bukan format zip"
+            file source.zip || true
+            exit 1
+          }
+
           PUBSPEC=$(find project -name pubspec.yaml -type f | head -n 1)
           if [ -z "$PUBSPEC" ]; then
             echo "::error::pubspec.yaml tidak ditemukan di ZIP"
+            find project -maxdepth 3 -type f | head -50 || true
             exit 1
           fi
           PROJECT_DIR=$(dirname "$PUBSPEC")
