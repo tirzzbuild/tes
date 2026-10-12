@@ -1,0 +1,95 @@
+name: Web to APK
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website"
+        required: true
+        type: string
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+        type: string
+      icon_url:
+        description: "URL icon"
+        required: false
+        type: string
+      tag:
+        description: "Tag build"
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create WebView Flutter project
+        env:
+          WEB_URL: ${{ github.event.inputs.web_url }}
+          APP_NAME: ${{ github.event.inputs.app_name }}
+        run: |
+          set -euo pipefail
+          flutter create --org com.tirzz.web2apk --project-name web2apk_app app
+          # Simple WebView main — user dapat ganti template di repo
+          cat > app/lib/main.dart << 'DART'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              const url = String.fromEnvironment('WEB_URL', defaultValue: 'https://flutter.dev');
+              return MaterialApp(
+                title: 'Web2APK',
+                home: Scaffold(
+                  body: SafeArea(
+                    child: WebViewWidget(
+                      controller: WebViewController()
+                        ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                        ..loadRequest(Uri.parse(url)),
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+          DART
+          cd app
+          flutter pub add webview_flutter || true
+          # Inject URL via dart-define di step build
+
+      - name: Build APK
+        working-directory: app
+        env:
+          WEB_URL: ${{ github.event.inputs.web_url }}
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build apk --release --dart-define=WEB_URL="$WEB_URL"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web2apk-${{ github.event.inputs.tag }}
+          path: app/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 5
